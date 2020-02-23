@@ -1,0 +1,198 @@
+#!/usr/bin/env node
+
+/*!
+ * bin/twitter-bot - Twitter Auction Notify executable
+ * Copyright (c) 2020, Mark Tyneway (MIT License).
+ * https://github.com/tynes/hsd-auction-notify
+ */
+
+'use strict';
+
+process.title = 'twitter-bot-auction-notify';
+
+const Config = require('bcfg');
+const Logger = require('blgr');
+const AuctionNotifyClient = require('../lib/client');
+const assert = require('bsert');
+const Twitter = require('twitter');
+const Network = require('hsd/lib/protocol/network');
+
+const types = {
+  OPEN: 0,
+  BID: 1,
+  REVEAL: 2,
+  REGISTER: 3,
+  BID_BURNED: 4,
+  BIG_SPEND: 5
+};
+
+const typesByVal = {
+  [types.OPEN]: 'OPEN',
+  [types.BID]: 'BID',
+  [types.REVEAL]: 'REVEAL',
+  [types.REGISTER]: 'REGISTER',
+  [types.BID_BURNED]: 'BID_BURNED',
+  [types.BIG_SPEND]: 'BIG_SPEND'
+};
+
+const ports = (network) => network.rpcPort + 3;
+
+const text = {
+  open: (name) => '' +
+`🆕 Open ${name} 🆕`,
+  bid: (name, value) => '' +
+`🙈 Bid ${name} 🙈
+Lockup: ${value}`,
+  reveal: (name, value) => '' +
+`👀`,
+  register: (name, value) => '' +
+`🤝 Register ${name}`;
+  bidBurned: (name, value, address) => '' +
+`BID BURNED ${name}
+Value ${value}
+Address: ${address}`;
+  bigSpend: (name, value) => '' +
+`Big Spend ${value}`;
+}
+
+class TwitterBot {
+  constructor() {
+    this.config = new Config('hsd');
+
+    this.config.load({
+      argv: true,
+      env: true
+    });
+
+    const network = this.config.str('network', 'main');
+    this.network = Network.get(network);
+
+    const loglevel = this.config.str('log-level', 'info');
+    this.logger = new Logger(loglevel);
+
+    this.client = new AuctionNotifyClient({
+      network: this.network.type,
+      port: this.config.str('http-port', ports(network)),
+      host: this.config.str('http-host')
+    });
+
+    this.twitter = new Twitter({
+      consumer_key: this.config.str('consumer-key'),
+      consumer_secret: this.config.str('consumer-secret'),
+      access_token_key: this.config.str('access-token-key'),
+      access_token_secret: this.config.str('access-token-secret')
+    });
+
+    // create a new twitter bot
+    this.init();
+  }
+
+  init() {
+    this.client.bind('bid', async (data) => {
+      await this.maybeTweet(data, types.BID);
+    });
+
+    this.client.bind('reveal', async (data) => {
+      await this.maybeTweet(data, types.REVEAL);
+    });
+
+    this.client.bind('register', async (data) => {
+      await this.maybeTweet(data, types.REGISTER);
+    });
+
+    this.client.bind('bid burned', async (data) => {
+      await this.maybeTweet(data, types.BID_BURNED);
+    });
+
+    this.client.bind('open', async (data) => {
+      await this.maybeTweet(data, types.OPEN);
+    });
+
+    this.client.bind('big spend', async (data) => {
+      await this.maybeTweet(data, types.BID_SPEND);
+    });
+
+    this.client.bind('block connect', async () => {
+      this.logger.info('block connect');
+    });
+  }
+
+  async maybeTweet(data, type) {
+    assert(typeof data.name === 'string');
+    assert(typeof data.outpoint === 'object');
+    assert(Number.isNumber(data.value));
+
+    const {name, outpoint} = data;
+    const {hash, index} = outpoint;
+
+    const coin = await this.client.getCoin(outpoint, hash);
+
+    if (!coin)
+      throw new Error('Coin not found!')
+
+    let tweet;
+    switch (type) {
+      case types.OPEN:
+          tweet = text.open(name);
+        break;
+      case types.BID:
+          tweet = text.bid(name, coin.value);
+        break;
+      case types.REVEAL:
+          tweet = text.reveal(name, coin.value);
+        break;
+      case types.REGISTER:
+          tweet = text.register(name, coin.value);
+        break;
+      case types.BID_BURNED:
+          tweet = text.bidBurned(name, coin.value, coin.address);
+        break;
+      case types.BIG_SPEND:
+          tweet = text.bigSpend(name, coin.value);
+        break;
+      default:
+        break;
+    }
+
+    try {
+      const response = await this.tweet(tweet);
+
+      if (response)
+        this.logger.info(`Success: ${typesByVal[type]} ${hash} ${index}`);
+
+    } catch (e) {
+      this.logger.error(e);
+    }
+  }
+
+  async tweet(str) {
+    assert(typeof str === 'string');
+    const response = await this.twitter.post('statuses/update', {status: str});
+
+    return response;
+  }
+
+  async open() {
+    await this.logger.open();
+    await this.client.open();
+  }
+
+  async close() {
+    await this.client.close();
+    await this.logger.close();
+  }
+
+  help() {
+    const str = '';
+    console.log(str);
+  }
+}
+
+(async () => {
+  const bot = new TwitterBot();
+  await bot.open();
+})().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+
