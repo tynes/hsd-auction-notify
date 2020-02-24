@@ -23,7 +23,8 @@ const types = {
   REVEAL: 2,
   REGISTER: 3,
   BID_BURNED: 4,
-  BIG_SPEND: 5
+  BIG_SPEND: 5,
+  STATS: 6
 };
 
 const typesByVal = {
@@ -46,13 +47,13 @@ Lockup: ${value}`,
   reveal: (name, value) => '' +
 `👀`,
   register: (name, value) => '' +
-`🤝 Register ${name}`;
+`🤝 Register ${name}`,
   bidBurned: (name, value, address) => '' +
 `BID BURNED ${name}
 Value ${value}
-Address: ${address}`;
+Address: ${address}`,
   bigSpend: (name, value) => '' +
-`Big Spend ${value}`;
+`Big Spend ${value}`
 }
 
 class TwitterBot {
@@ -72,8 +73,11 @@ class TwitterBot {
 
     this.client = new AuctionNotifyClient({
       network: this.network.type,
-      port: this.config.str('http-port', ports(network)),
-      host: this.config.str('http-host')
+      port: this.config.str('http-port', ports(this.network)),
+      url: this.config.str('url'),
+      host: this.config.str('http-host', '127.0.0.1'),
+      apiKey: this.config.str('api-key'),
+      ssl: this.config.bool('ssl')
     });
 
     this.twitter = new Twitter({
@@ -89,43 +93,81 @@ class TwitterBot {
 
   init() {
     this.client.bind('bid', async (data) => {
-      await this.maybeTweet(data, types.BID);
+      try {
+        await this.maybeTweet(data, types.BID);
+      } catch (e) {
+        this.logger.error(e);
+      }
     });
 
     this.client.bind('reveal', async (data) => {
-      await this.maybeTweet(data, types.REVEAL);
+      try {
+        await this.maybeTweet(data, types.REVEAL);
+      } catch (e) {
+        this.logger.error(e);
+      }
     });
 
     this.client.bind('register', async (data) => {
-      await this.maybeTweet(data, types.REGISTER);
+      try {
+        await this.maybeTweet(data, types.REGISTER);
+      } catch (e) {
+        this.logger.error(e);
+      }
     });
 
     this.client.bind('bid burned', async (data) => {
-      await this.maybeTweet(data, types.BID_BURNED);
+      try {
+        await this.maybeTweet(data, types.BID_BURNED);
+      } catch (e) {
+        this.logger.error(e);
+      }
     });
 
     this.client.bind('open', async (data) => {
-      await this.maybeTweet(data, types.OPEN);
+      try {
+        await this.maybeTweet(data, types.OPEN);
+      } catch (e) {
+        this.logger.error(e);
+      }
     });
 
     this.client.bind('big spend', async (data) => {
-      await this.maybeTweet(data, types.BID_SPEND);
+      try {
+        await this.maybeTweet(data, types.BID_SPEND);
+      } catch (e) {
+        this.logger.error(e);
+      }
     });
+
+    this.client.bind('stats', async (data) => {
+      try {
+        await this.tweetStats(data);
+      } catch (e) {
+        this.logger.error(e);
+      }
+    })
 
     this.client.bind('block connect', async () => {
       this.logger.info('block connect');
     });
   }
 
+  async tweetStats(data) {
+    // handle the stats object
+    // safe to tweet for each block
+  }
+
   async maybeTweet(data, type) {
     assert(typeof data.name === 'string');
     assert(typeof data.outpoint === 'object');
-    assert(Number.isNumber(data.value));
+    assert(typeof data.value === 'number');
+    // TODO: convert dollarydoos value to HNS
 
     const {name, outpoint} = data;
     const {hash, index} = outpoint;
 
-    const coin = await this.client.getCoin(outpoint, hash);
+    const coin = await this.client.getCoin(hash.toString('hex'), index);
 
     if (!coin)
       throw new Error('Coin not found!')
@@ -133,22 +175,26 @@ class TwitterBot {
     let tweet;
     switch (type) {
       case types.OPEN:
-          tweet = text.open(name);
+        return;
+
+        tweet = text.open(name);
         break;
       case types.BID:
-          tweet = text.bid(name, coin.value);
+        // only tweet if interesting
+
+        tweet = text.bid(name, coin.value);
         break;
       case types.REVEAL:
-          tweet = text.reveal(name, coin.value);
+        tweet = text.reveal(name, coin.value);
         break;
       case types.REGISTER:
-          tweet = text.register(name, coin.value);
+        tweet = text.register(name, coin.value);
         break;
       case types.BID_BURNED:
-          tweet = text.bidBurned(name, coin.value, coin.address);
+        tweet = text.bidBurned(name, coin.value, coin.address);
         break;
       case types.BIG_SPEND:
-          tweet = text.bigSpend(name, coin.value);
+        tweet = text.bigSpend(name, coin.value);
         break;
       default:
         break;
