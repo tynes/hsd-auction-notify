@@ -16,6 +16,8 @@ const AuctionNotifyClient = require('../lib/client');
 const assert = require('bsert');
 const Twitter = require('twitter');
 const Network = require('hsd/lib/protocol/network');
+const Amount = require('hsd/lib/ui/amount');
+
 
 const types = {
   OPEN: 0,
@@ -23,7 +25,7 @@ const types = {
   REVEAL: 2,
   REGISTER: 3,
   BID_BURNED: 4,
-  BIG_SPEND: 5,
+  NONE: 5,
   STATS: 6
 };
 
@@ -33,7 +35,8 @@ const typesByVal = {
   [types.REVEAL]: 'REVEAL',
   [types.REGISTER]: 'REGISTER',
   [types.BID_BURNED]: 'BID_BURNED',
-  [types.BIG_SPEND]: 'BIG_SPEND'
+  [types.NONE]: 'NONE',
+  [types.STATS]: 'STATS'
 };
 
 const ports = (network) => network.rpcPort + 3;
@@ -41,20 +44,36 @@ const ports = (network) => network.rpcPort + 3;
 const text = {
   open: (name) => '' +
 `🆕 Open ${name} 🆕`,
-  bid: (name, value) => '' +
-`🙈 Bid ${name} 🙈
-Lockup: ${value}`,
-  reveal: (name, value) => '' +
-`👀`,
+  bid: (name, value, count, height, blocksUntilReveal) => '' +
+`🙈 Bid .${name} 🙈
+Height ${height}
+Lockup: ${value} $HNS
+Total bids ${count}
+${blocksUntilReveal} blocks Left to bid`,
+  reveal: (name, value, count, height, blocksUntilClose) => '' +
+`👀 Reveal .${name} 👀 
+Height ${height}
+${value} $HNS
+Total reveals ${count}
+${blocksUntilClose} Blocks left to reveal`,
   register: (name, value) => '' +
-`🤝 Register ${name}`,
-  bidBurned: (name, value, address) => '' +
+`🤝 Register ${name}
+Burned ${value} $HNS`,
+  bidBurned: (name, value) => '' +
 `BID BURNED ${name}
-Value ${value}
-Address: ${address}`,
+Value ${value}`,
   bigSpend: (name, value) => '' +
-`Big Spend ${value}`
+`Big Spend ${value} $HNS`,
+  stats: (data) => '' +
+`Block ${data.height} Stats
+${data.txCount} Transactions
+${data.airdrops} Airdrops Claimed
+${Amount.coin(data.transferredValue)} $HNS Moved
+${Amount.coin(data.inflation)} Newly Minted $HNS
+${Amount.coin(data.lockedUpValue)} $HNS Locked Up in Bids`,
 }
+// TODO: remove the Amount.coin calls
+// from the stats codepath
 
 class TwitterBot {
   constructor() {
@@ -65,8 +84,20 @@ class TwitterBot {
       env: true
     });
 
+    this.dictionary = new Set([
+      'satoshi'
+    ]);
+
     const network = this.config.str('network', 'main');
     this.network = Network.get(network);
+
+    // u64?
+    // All amounts from ux should be in coins
+    this.bidThreshold = this.config.uint('bid-threshold', 10000);
+    this.bidCountThreshold = this.config.uint('bid-count-threshold', 5);
+    this.revealThreshold = this.config.uint('reveal-threshold', 10000);
+    this.revealCountThreshold = this.config.uint('reveal-count-threshold', 5);
+    this.bigSpendThreshold = this.config.uint('big-spend-threshold', 1000000);
 
     const loglevel = this.config.str('log-level', 'info');
     this.logger = new Logger(loglevel);
@@ -132,9 +163,9 @@ class TwitterBot {
       }
     });
 
-    this.client.bind('big spend', async (data) => {
+    this.client.bind('none', async (data) => {
       try {
-        await this.maybeTweet(data, types.BID_SPEND);
+        await this.maybeTweet(data, types.NONE);
       } catch (e) {
         this.logger.error(e);
       }
@@ -148,63 +179,105 @@ class TwitterBot {
       }
     })
 
-    this.client.bind('block connect', async () => {
+    this.client.bind('block connect', async (entry, block, view) => {
       this.logger.info('block connect');
     });
   }
 
   async tweetStats(data) {
-    // handle the stats object
-    // safe to tweet for each block
+    assert(typeof data.txCount === 'number');
+    assert(typeof data.height === 'number');
+    assert(typeof data.airdrops === 'number');
+    assert(typeof data.inflation === 'number');
+    assert(typeof data.lockedUpValue === 'number');
+    assert(typeof data.transferredValue === 'number');
+
+    const tweet = text.stats(data);
+
+    try {
+      const response = await this.tweet(tweet);
+
+      if (response) {
+        this.logger.info('Success: stats %s: txs %s, inflation %s HNS, locked-up %s, xfer %s', data.height, data.txCount, Amount.coin(data.inflation), Amount.coin(data.lockedUpValue), Amount.coin(data.transferredValue));
+      }
+    } catch (e) {
+      this.logger.error(e);
+    }
   }
 
+  // TODO: after confirmation of it working,
+  // add a setTimeout
   async maybeTweet(data, type) {
     assert(typeof data.name === 'string');
     assert(typeof data.outpoint === 'object');
     assert(typeof data.value === 'number');
-    // TODO: convert dollarydoos value to HNS
+    assert(typeof data.height === 'number');
 
-    const {name, outpoint} = data;
+    if (data.ns == null && type !== types.NONE)
+      this.logger.info('No data.ns: %s %s', data.name, typesByVal[type]);
+
+    if (data.as == null && type !== types.NONE)
+      this.logger.info('No data.as: %s %s', data.name, typesByVal[type]);
+
+    const {name, outpoint, height, as} = data;
     const {hash, index} = outpoint;
 
     const coin = await this.client.getCoin(hash.toString('hex'), index);
 
     if (!coin)
-      throw new Error('Coin not found!')
+      this.logger.info('Cannot find %s %s/%s', typesByVal[type], hash.toString('hex'), index);
+
+    const value = Amount.coin(data.value);
+    const info = await this.client.getNotifyName(name);
+
+    // There is no nameinfo if it is type NONE
+    if (!info && type !== types.NONE) {
+      this.logger.info('Cannot find name info %s %s', typesByVal[type], name);
+      return;
+    }
 
     let tweet;
     switch (type) {
       case types.OPEN:
-        return;
-
-        tweet = text.open(name);
+        if (this.dictionary.has(name))
+          tweet = text.open(name);
         break;
       case types.BID:
-        // only tweet if interesting
-
-        tweet = text.bid(name, coin.value);
+        if ((value >= this.bidThreshold)
+            || (info.bids.length >= this.bidCountThreshold))
+          tweet = text.bid(name, value, info.bids.length, height, as.blocksUntilReveal);
         break;
       case types.REVEAL:
-        tweet = text.reveal(name, coin.value);
+        if ((value >= this.revealThreshold)
+            || (info.reveals.length >= this.revealCountThreshold))
+          tweet = text.reveal(name, value, info.reveals.length, height, as.blocksUntilClose);
         break;
       case types.REGISTER:
-        tweet = text.register(name, coin.value);
+        if (insecureRandomRange(20) < 15)
+          tweet = text.register(name, value);
         break;
       case types.BID_BURNED:
-        tweet = text.bidBurned(name, coin.value, coin.address);
+        tweet = text.bidBurned(name, value);
         break;
-      case types.BIG_SPEND:
-        tweet = text.bigSpend(name, coin.value);
+      case types.NONE:
+        if (value >= this.bigSpendThreshold)
+          tweet = text.bigSpend(name, value);
         break;
       default:
         break;
     }
 
+    if (!tweet) {
+      this.logger.info('Did not meet criteria: %s %s', name, typesByVal[type]);
+      return;
+    }
+
+
     try {
       const response = await this.tweet(tweet);
 
       if (response)
-        this.logger.info(`Success: ${typesByVal[type]} ${hash} ${index}`);
+        this.logger.info(`Success: ${typesByVal[type]} ${hash.toString('hex')} ${index}`);
 
     } catch (e) {
       this.logger.error(e);
@@ -232,6 +305,10 @@ class TwitterBot {
     const str = '';
     console.log(str);
   }
+}
+
+function insecureRandomRange(max) {
+  return Math.floor(Math.random() * Math.floor(max));
 }
 
 (async () => {
